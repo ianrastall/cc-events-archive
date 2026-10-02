@@ -399,3 +399,8 @@ FodyWeavers.xsd
 
 # JetBrains Rider
 *.sln.iml
+
+# Chess.com events pipeline: working state and raw downloads stay local
+/work/
+/raw/
+__pycache__/
