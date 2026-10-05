@@ -97,7 +97,7 @@ SERIES_PATTERNS = {
     "3-0 Thursday": re.compile(r"3\s*0\s*thursday"),
     "CCC": re.compile(r"computer\s*chess\s*championship|\bccc\b|\bcccc\b"),
 }
-TEST_PATTERN = re.compile(r"\bcbtest|\btest\b|\btrial knockout\b|\bcb ugly\b")   # Chess.com's broadcast rehearsals
+TEST_PATTERN = re.compile(r"\bcbtest|\bteste?\b|\btrial knockout\b|\bcb ugly\b")   # Chess.com's broadcast rehearsals
 # The Olympiads (open and women's) are kept whatever their average: the user's
 # call, 2026-10-05. Not the youth, disabled or online Olympiads, which are
 # smaller events and are judged like any other.
@@ -168,7 +168,7 @@ def log(msg: str) -> None:
 
 
 # Columns added after the first catalogs were built; applied to existing ones.
-MIGRATIONS = (("file", "dir", "text"), ("event", "site_tag", "text"), ("event", "origin", "text"), ("event", "pub_name", "text"), ("event", "byes", "integer"), ("event", "date_strays", "integer"), ("event", "ely_kind", "text"),
+MIGRATIONS = (("file", "dir", "text"), ("event", "site_tag", "text"), ("player", "ely_by_event", "integer"), ("player", "ely_by_name", "integer"), ("event", "origin", "text"), ("event", "pub_name", "text"), ("event", "byes", "integer"), ("event", "date_strays", "integer"), ("event", "ely_kind", "text"),
               ("event", "identity_doubt", "text"), ("player", "doubt", "text"),
               ("player", "in_roster", "integer"),
               # crosstable stage
@@ -1499,7 +1499,165 @@ def stage_tables(con: sqlite3.Connection, limit: int | None = None) -> None:
 # classify
 # --------------------------------------------------------------------------
 
+def resolve_by_event(con: sqlite3.Connection) -> None:
+    """Rate players who have no FIDE id through the event's Elysium record.
+
+    Chess.com's older files name many players by surname only ("Carlsen
+    (NOR)") or without an id ("Garry Kasparov"), so nothing could be looked up
+    for them and strong events were left unjudged. Where the event itself has
+    been matched in Elysium, its games say who those players are: a name of
+    ours that fits exactly one player of that event is that player, and gets
+    that player's standard rating for the month. player.ely_by_event records
+    the attempt (1 found, 0 not)."""
+    todo = con.execute(
+        "select distinct e.slug from event e join player p on p.slug = e.slug "
+        "where e.ely_event_id is not null and e.origin is null and p.fide_id is null "
+        "and p.elo_ely is null and p.ely_by_event is null").fetchall()
+    if not todo:
+        return
+    ely = Elysium()
+    cur = ely.cur
+    found = 0
+    for row in todo:
+        ev = con.execute("select * from event where slug = ?", (row["slug"],)).fetchone()
+        start = ev["ely_start"] if ev["date_suspect"] and ev["ely_start"] else (ev["tag_start"] or ev["ely_start"])
+        month = start[:7] if start and len(start) >= 7 else (f"{start}-12" if start else None)
+        games = cur.execute("select id, white_player_id, black_player_id from game where event_id = ?",
+                            (ev["ely_event_id"],)).fetchall()
+        sides = {g[0]: (g[1], g[2]) for g in games}
+        known: dict[int, set[str]] = defaultdict(set)   # Elysium player -> names printed for them here
+        ids = list(sides)
+        for j in range(0, len(ids), 500):
+            part = ids[j:j + 500]
+            for game_id, white, black in cur.execute(
+                    "select game_id, raw_white, raw_black from game_observation "
+                    f"where id in ({','.join('?' * len(part))})", part):
+                if game_id in sides:
+                    for player_id, name in zip(sides[game_id], (white, black)):
+                        if player_id and name:
+                            known[player_id].add(name)
+        keyed = {pid: [name_keys(n) for n in names] for pid, names in known.items()}
+        for p in con.execute("select * from player where slug = ? and fide_id is null and elo_ely is null "
+                             "and ely_by_event is null", (ev["slug"],)).fetchall():
+            full, fam = name_keys(p["name"])
+            hits = {pid for pid, keys in keyed.items()
+                    if any((full & their_full) if (full and their_full) else (fam & their_fam)
+                           for their_full, their_fam in keys)}
+            rating = None
+            if len(hits) == 1 and month:
+                chain, pid = [], next(iter(hits))
+                while pid and len(chain) < 6:   # follow soft merges to the live identity
+                    chain.append(pid)
+                    merged = cur.execute("select merged_into from player where id = ?", (pid,)).fetchone()
+                    pid = merged[0] if merged else None
+                rating = ely.rating_at(",".join(map(str, chain)), month)
+            if rating:
+                found += 1
+                con.execute("update player set elo_ely = ?, elo_ely_period = ?, ely_by_event = 1 "
+                            "where slug = ? and key = ?", (rating[0], rating[1], ev["slug"], p["key"]))
+            else:
+                con.execute("update player set ely_by_event = 0 where slug = ? and key = ?", (ev["slug"], p["key"]))
+        if month and not ev["rating_month"]:
+            con.execute("update event set rating_month = ? where slug = ?", (month, ev["slug"]))
+    con.commit()
+    log(f"classify: {found} players without a FIDE id rated through their event's Elysium record ({len(todo)} events)")
+
+
+def resolve_by_name(con: sqlite3.Connection) -> None:
+    """Last resort for events still unjudged for lack of ratings: find their
+    id-less players among Elysium's rated players by name.
+
+    Only players who have ever been rated 2200 or more are considered, and a
+    name is accepted only when it cannot be anyone else:
+      - a full name ("Garry Kasparov") that fits one such player with a rating
+        at the time; or several, of whom exactly one is within 60 points of
+        the file's Elo tag;
+      - a bare surname ("Carlsen (NOR)") that fits exactly one player rated
+        2500 or more at the time. Title matches and elite events are what
+        Chess.com left without ids, and at that level a surname is one person.
+    player.ely_by_name records the attempt (1 found, 0 not)."""
+    todo = con.execute(
+        "select distinct e.slug from event e join player p on p.slug = e.slug "
+        "where e.decision = 'review' and e.origin is null and p.fide_id is null and p.elo_ely is null "
+        "and p.ely_by_name is null").fetchall()
+    if not todo:
+        return
+    ely = Elysium()
+    cur = ely.cur
+    strong = [r[0] for r in cur.execute(
+        "select distinct player_id from rating where system = 'combined' and scope = 'standard' and value >= 2200")]
+    by_full: dict[str, set[int]] = defaultdict(set)
+    by_family: dict[str, set[int]] = defaultdict(set)
+    person: dict[int, tuple[str, bool]] = {}   # id -> (name as displayed, has a birth date)
+    by_words: dict[frozenset, set[int]] = defaultdict(set)   # the name's words, in any order
+    for j in range(0, len(strong), 900):
+        part = strong[j:j + 900]
+        for pid, display, birth in cur.execute(
+                f"select id, display_name, birth_date from player where id in ({','.join('?' * len(part))})", part):
+            person[pid] = (norm_name(display or ""), bool(birth))
+            by_words[frozenset(person[pid][0].split())].add(pid)
+            full, fam = name_keys(display or "")
+            for key in full:
+                by_full[key].add(pid)
+            if "," in (display or ""):
+                by_family[norm_name(display.split(",")[0])].add(pid)
+    found = 0
+    for row in todo:
+        ev = con.execute("select * from event where slug = ?", (row["slug"],)).fetchone()
+        start = ev["ely_start"] if ev["date_suspect"] and ev["ely_start"] else (ev["start"] or ev["tag_start"])
+        if ev["date_suspect"] and not ev["ely_start"] and ev["slug_years"]:
+            start = ev["slug_years"].split(",")[0]   # the PGN's dates are import dates; the name gives the year
+        month = ev["rating_month"] if ev["rating_month"] and not ev["date_suspect"] else None
+        month = month or (start[:7] if start and len(start) >= 7 else (f"{start}-07" if start else None))
+        for p in con.execute("select * from player where slug = ? and fide_id is null and elo_ely is null "
+                             "and ely_by_name is null", (ev["slug"],)).fetchall():
+            full, fam = name_keys(p["name"])
+            rating = None
+            if month:
+                words = frozenset(norm_name(re.sub(r"\([^)]*\)", " ", p["name"])).split())
+                if full and by_words.get(words):
+                    # "Viswanathan Anand" is "Anand, Viswanathan" and nobody else.
+                    candidates = set(by_words[words])
+                elif full:
+                    candidates = set().union(*(by_full.get(key, set()) for key in full))
+                else:
+                    candidates = set().union(*(by_family.get(key, set()) for key in fam))
+                # A rating more than five years old at the time is not a rating then:
+                # a "classics" page dated to its 2020 upload must not rate Morphy.
+                rated = [(pid, r) for pid in candidates
+                         if (r := ely.rating_at(str(pid), month)) and int(r[1][:4]) >= int(month[:4]) - 5]
+                # Elysium holds some players twice under one name (the FIDE
+                # record and an older import). Records with the same displayed
+                # name are one person: the record with a birth date, then the
+                # one with the more recent rating, speaks for them.
+                one_each: dict[str, tuple] = {}
+                for pid, r in rated:
+                    rank = (person[pid][1], r[1])
+                    if person[pid][0] not in one_each or rank > one_each[person[pid][0]][0]:
+                        one_each[person[pid][0]] = (rank, pid, r)
+                rated = [(pid, r) for _, pid, r in one_each.values()]
+                if full:
+                    if len(rated) > 1 and p["elo_first"]:
+                        rated = [(pid, r) for pid, r in rated if abs(r[0] - p["elo_first"]) <= 60]
+                else:
+                    rated = [(pid, r) for pid, r in rated if r[0] >= 2500]
+                if len(rated) == 1:
+                    rating = rated[0][1]
+            if rating:
+                found += 1
+                con.execute("update player set elo_ely = ?, elo_ely_period = ?, ely_by_name = 1 "
+                            "where slug = ? and key = ?", (rating[0], rating[1], ev["slug"], p["key"]))
+            else:
+                con.execute("update player set ely_by_name = 0 where slug = ? and key = ?", (ev["slug"], p["key"]))
+        if month and (not ev["rating_month"] or ev["date_suspect"]):
+            con.execute("update event set rating_month = ? where slug = ?", (month, ev["slug"]))
+    con.commit()
+    log(f"classify: {found} players without a FIDE id rated by name among Elysium's rated players ({len(todo)} events)")
+
+
 def stage_classify(con: sqlite3.Connection) -> None:
+    resolve_by_event(con)
+    resolve_by_name(con)
     events = con.execute("select * from event").fetchall()
     for ev in events:
         # Dates: the matched crosstable states the event's dates; otherwise the
@@ -1743,18 +1901,38 @@ def drop_twins(con: sqlite3.Connection) -> None:
 
     # An old event Chess.com also carries (the 1972 Spassky-Fischer match) is
     # kept once, from the historical collection: the user's call, 2026-10-05.
-    historical: dict[str, list] = defaultdict(list)
-    for ev in con.execute("select slug, start from event where decision = 'keep' and origin = 'historical'"):
-        historical[ev["start"][:4]].append(ev["slug"])
+    historical: dict[int, list] = defaultdict(list)
+    for ev in con.execute("select slug, start, games from event where decision = 'keep' and origin = 'historical'"):
+        historical[int(ev["start"][:4])].append(ev)
 
     def roster(slug: str) -> Roster:
         return Roster(r["name"] for r in con.execute("select name from player where slug = ?", (slug,)))
 
-    for ev in con.execute("select slug, start from event where decision = 'keep' and origin is null "
+    def same_event(ev, ours: Roster):
+        year = int(ev["start"][:4])
+        for h in historical.get(year, []):
+            theirs = roster(h["slug"])
+            common = roster_overlap(ours, theirs) if theirs.n == ours.n else 0
+            # The same field; or a match of as many games in which one name
+            # agrees and the other is spelled another way (Korchnoi, Kortschnoj).
+            if common == ours.n or (ours.n == 2 and common == 1 and h["games"] == ev["games"]):
+                return h["slug"]
+        if ours.n == 2 and len(ev["start"]) == 4:
+            # Chess.com dates some old matches by guesswork ("1886 Lasker vs
+            # Steinitz" is the 1894 match): the same two players over the same
+            # number of games within a decade is the same match. Only where
+            # our date is a bare year: Kasparov and Karpov played four 24-game
+            # matches, and a dated one is not to be mistaken for another.
+            for other in range(year - 10, year + 11):
+                for h in historical.get(other, []):
+                    if h["games"] == ev["games"] and (theirs := roster(h["slug"])).n == 2 \
+                            and roster_overlap(ours, theirs) == 2:
+                        return h["slug"]
+        return None
+
+    for ev in con.execute("select slug, start, games from event where decision = 'keep' and origin is null "
                           "and start < '1991'").fetchall():
-        ours = roster(ev["slug"])
-        same = next((h for h in historical.get(ev["start"][:4], [])
-                     if (theirs := roster(h)).n == ours.n and roster_overlap(ours, theirs) == ours.n), None)
+        same = same_event(ev, roster(ev["slug"]))
         if same:
             con.execute("update event set decision = 'twin', reason = ? where slug = ?",
                         (f"the historical collection has this event: {same}", ev["slug"]))

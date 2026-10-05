@@ -3,22 +3,22 @@
     "id": "cc-events-all",
     "title": "Every event in the archive",
     "minAverage": 0,
-    "events": 5569,
+    "events": 5601,
     "updated": "2026-10-05",
-    "games": 402272,
-    "bytes": 195943472,
+    "games": 404345,
+    "bytes": 197038614,
     "newest": "2026-09-16",
     "files": [
       {
         "file": "cc-events-all.zip",
-        "bytes": 195943472,
-        "sha256": "fb68374215e022493a29dbea0a728432aa214703f17f72cbe415af83f78072c0",
-        "events": 5569,
-        "games": 402272,
+        "bytes": 197038614,
+        "sha256": "2b83b6d7a7e29e3d627efaeecdd8274cbfff6cc66608f3adc71b9beebe36d87a",
+        "events": 5601,
+        "games": 404345,
         "from": "1834",
         "to": "2026",
-        "url": "https://pixeldrain.com/u/2TtpEPHR",
-        "pixeldrain": "2TtpEPHR"
+        "url": "https://pixeldrain.com/u/ZPeg1APN",
+        "pixeldrain": "ZPeg1APN"
       }
     ]
   },
@@ -26,22 +26,22 @@
     "id": "cc-events-2600",
     "title": "Events with a tournament average of 2600 or more",
     "minAverage": 2600,
-    "events": 1540,
+    "events": 1564,
     "updated": "2026-10-05",
-    "games": 90555,
-    "bytes": 45572621,
+    "games": 91678,
+    "bytes": 46146500,
     "newest": "2026-08-30",
     "files": [
       {
         "file": "cc-events-2600.zip",
-        "bytes": 45572621,
-        "sha256": "53781cb8ea81324af90df9cf495cbc8e6a62be00442ec26765c5a44494766152",
-        "events": 1540,
-        "games": 90555,
+        "bytes": 46146500,
+        "sha256": "f6f9424b2c0bdd57c5e14fd3e31f318af0a64637055a1b4a6400bd6c372c6b91",
+        "events": 1564,
+        "games": 91678,
         "from": "1858",
         "to": "2026",
-        "url": "https://pixeldrain.com/u/v1evbtZM",
-        "pixeldrain": "v1evbtZM"
+        "url": "https://pixeldrain.com/u/VabLKDKC",
+        "pixeldrain": "VabLKDKC"
       }
     ]
   },
@@ -49,22 +49,22 @@
     "id": "cc-events-2700",
     "title": "Events with a tournament average of 2700 or more",
     "minAverage": 2700,
-    "events": 619,
+    "events": 637,
     "updated": "2026-10-05",
-    "games": 31771,
-    "bytes": 17918203,
+    "games": 32064,
+    "bytes": 18076569,
     "newest": "2026-08-22",
     "files": [
       {
         "file": "cc-events-2700.zip",
-        "bytes": 17918203,
-        "sha256": "f7150033b1431c10a2011c1f475a48da8c689f75cbc24c397e8b70867a44a19b",
-        "events": 619,
-        "games": 31771,
+        "bytes": 18076569,
+        "sha256": "28f7dd81bae50ff23425283f0cca15e80c2b17e87a5b21adb2ce41d5346c68dc",
+        "events": 637,
+        "games": 32064,
         "from": "1858",
         "to": "2026",
-        "url": "https://pixeldrain.com/u/ESVFdXLv",
-        "pixeldrain": "ESVFdXLv"
+        "url": "https://pixeldrain.com/u/nNUP5LDF",
+        "pixeldrain": "nNUP5LDF"
       }
     ]
   }
