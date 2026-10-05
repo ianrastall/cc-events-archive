@@ -3,41 +3,22 @@
     "id": "cc-events-all",
     "title": "Every event in the archive",
     "minAverage": 0,
-    "events": 5570,
+    "events": 5569,
     "updated": "2026-10-05",
-    "games": 402293,
-    "bytes": 195944120,
+    "games": 402272,
+    "bytes": 195943472,
     "newest": "2026-09-16",
     "files": [
       {
-        "file": "cc-events-all-1834-2019.zip",
-        "bytes": 92594347,
-        "sha256": "bee83dac1594aa73c1e132e56e4fbc0dc47d547e9ca1e5607e943269e7a3f378",
-        "events": 3959,
-        "games": 234909,
+        "file": "cc-events-all.zip",
+        "bytes": 195943472,
+        "sha256": "fb68374215e022493a29dbea0a728432aa214703f17f72cbe415af83f78072c0",
+        "events": 5569,
+        "games": 402272,
         "from": "1834",
-        "to": "2019",
-        "url": "https://github.com/ianrastall/cc-events-archive/raw/main/bundles/cc-events-all-1834-2019.zip"
-      },
-      {
-        "file": "cc-events-all-2020-2025.zip",
-        "bytes": 89267643,
-        "sha256": "096eb27d097815142ba32cd32b18280869ecc0aba69b04c1c08bf3fb1a6205a2",
-        "events": 1387,
-        "games": 147017,
-        "from": "2020",
-        "to": "2025",
-        "url": "https://github.com/ianrastall/cc-events-archive/raw/main/bundles/cc-events-all-2020-2025.zip"
-      },
-      {
-        "file": "cc-events-all-2026.zip",
-        "bytes": 14082130,
-        "sha256": "ed197c7043f28249390fa5195f76d3fc7af961fd889ae9087a57ac1ee4f6786c",
-        "events": 224,
-        "games": 20367,
-        "from": "2026",
         "to": "2026",
-        "url": "https://github.com/ianrastall/cc-events-archive/raw/main/bundles/cc-events-all-2026.zip"
+        "url": "https://pixeldrain.com/u/2TtpEPHR",
+        "pixeldrain": "2TtpEPHR"
       }
     ]
   },
@@ -45,21 +26,22 @@
     "id": "cc-events-2600",
     "title": "Events with a tournament average of 2600 or more",
     "minAverage": 2600,
-    "events": 1541,
+    "events": 1540,
     "updated": "2026-10-05",
-    "games": 90576,
-    "bytes": 45573266,
+    "games": 90555,
+    "bytes": 45572621,
     "newest": "2026-08-30",
     "files": [
       {
         "file": "cc-events-2600.zip",
-        "bytes": 45573266,
-        "sha256": "69f9feb9c8ccea1083c27dda2f841ab0739c86733aeaa536e1640aeadc9b2ae0",
-        "events": 1541,
-        "games": 90576,
+        "bytes": 45572621,
+        "sha256": "53781cb8ea81324af90df9cf495cbc8e6a62be00442ec26765c5a44494766152",
+        "events": 1540,
+        "games": 90555,
         "from": "1858",
         "to": "2026",
-        "url": "https://github.com/ianrastall/cc-events-archive/raw/main/bundles/cc-events-2600.zip"
+        "url": "https://pixeldrain.com/u/v1evbtZM",
+        "pixeldrain": "v1evbtZM"
       }
     ]
   },
@@ -67,21 +49,22 @@
     "id": "cc-events-2700",
     "title": "Events with a tournament average of 2700 or more",
     "minAverage": 2700,
-    "events": 620,
+    "events": 619,
     "updated": "2026-10-05",
-    "games": 31792,
-    "bytes": 17918896,
+    "games": 31771,
+    "bytes": 17918203,
     "newest": "2026-08-22",
     "files": [
       {
         "file": "cc-events-2700.zip",
-        "bytes": 17918896,
-        "sha256": "746e649a71e7f21a8ca4c34146a5336c850457552c7eeeaec5562722f82da809",
-        "events": 620,
-        "games": 31792,
+        "bytes": 17918203,
+        "sha256": "f7150033b1431c10a2011c1f475a48da8c689f75cbc24c397e8b70867a44a19b",
+        "events": 619,
+        "games": 31771,
         "from": "1858",
         "to": "2026",
-        "url": "https://github.com/ianrastall/cc-events-archive/raw/main/bundles/cc-events-2700.zip"
+        "url": "https://pixeldrain.com/u/ESVFdXLv",
+        "pixeldrain": "ESVFdXLv"
       }
     ]
   }

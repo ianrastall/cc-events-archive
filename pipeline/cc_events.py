@@ -1740,6 +1740,24 @@ def drop_twins(con: sqlite3.Connection) -> None:
             if ev["slug"] != best["slug"]:
                 con.execute("update event set decision = 'twin', reason = ? where slug = ?",
                             (f"another copy of {best['slug']} ({best['games']} games against {ev['games']})", ev["slug"]))
+
+    # An old event Chess.com also carries (the 1972 Spassky-Fischer match) is
+    # kept once, from the historical collection: the user's call, 2026-10-05.
+    historical: dict[str, list] = defaultdict(list)
+    for ev in con.execute("select slug, start from event where decision = 'keep' and origin = 'historical'"):
+        historical[ev["start"][:4]].append(ev["slug"])
+
+    def roster(slug: str) -> Roster:
+        return Roster(r["name"] for r in con.execute("select name from player where slug = ?", (slug,)))
+
+    for ev in con.execute("select slug, start from event where decision = 'keep' and origin is null "
+                          "and start < '1991'").fetchall():
+        ours = roster(ev["slug"])
+        same = next((h for h in historical.get(ev["start"][:4], [])
+                     if (theirs := roster(h)).n == ours.n and roster_overlap(ours, theirs) == ours.n), None)
+        if same:
+            con.execute("update event set decision = 'twin', reason = ? where slug = ?",
+                        (f"the historical collection has this event: {same}", ev["slug"]))
     con.commit()
 
 
