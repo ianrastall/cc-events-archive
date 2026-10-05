@@ -2900,6 +2900,54 @@ def pixeldrain_key() -> str | None:
     return key or None
 
 
+def pixeldrain_request(key: str, method: str, path: str) -> tuple[int, dict]:
+    request = urllib.request.Request(
+        f"{PIXELDRAIN_API}{path}", method=method,
+        headers={"Authorization": "Basic " + base64.b64encode(f":{key}".encode()).decode()})
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            return response.status, json.load(response)
+    except urllib.error.HTTPError as error:
+        try:
+            return error.code, json.loads(error.read().decode("utf-8", "replace"))
+        except ValueError:
+            return error.code, {}
+
+
+def pixeldrain_remove_superseded(key: str, described: list[dict]) -> None:
+    """Delete the uploads a newer one has replaced (the user's instruction,
+    2026-10-05). An id is deleted only when all of this holds: it was recorded
+    here as an earlier upload of one of these databases; it is not the id of
+    any current file; and every current file is on Pixeldrain with the size
+    and SHA-256 written to the manifest. Anything that cannot be deleted stays
+    listed under "superseded" and is tried again on the next run."""
+    current = {f["pixeldrain"] for bundle in described for f in bundle["files"] if f.get("pixeldrain")}
+    for bundle in described:
+        for f in bundle["files"]:
+            status, info = pixeldrain_request(key, "GET", f"/file/{f['pixeldrain']}/info")
+            if status != 200 or info.get("size") != f["bytes"] or info.get("hash_sha256") != f["sha256"]:
+                log(f"bundles: {f['file']} could not be confirmed on Pixeldrain (HTTP {status}); "
+                    "no earlier upload was deleted")
+                return
+    for bundle in described:
+        remaining = []
+        for old_id in bundle.get("superseded", []):
+            if old_id in current:
+                continue
+            status, reply = pixeldrain_request(key, "DELETE", f"/file/{old_id}")
+            if status == 200 or status == 404:
+                log(f"bundles: earlier upload {old_id} of {bundle['id']} "
+                    + ("deleted from Pixeldrain" if status == 200 else "was already gone from Pixeldrain"))
+            else:
+                remaining.append(old_id)
+                log(f"bundles: could not delete earlier upload {old_id} of {bundle['id']}: "
+                    f"HTTP {status} {reply.get('value', '')}; it will be tried again next time")
+        if remaining:
+            bundle["superseded"] = remaining
+        else:
+            bundle.pop("superseded", None)
+
+
 def pixeldrain_upload(key: str, filename: str, blob: bytes) -> str:
     """PUT one file to Pixeldrain; returns its id. Raises on any failure."""
     request = urllib.request.Request(
@@ -2991,17 +3039,19 @@ def stage_bundles(con: sqlite3.Connection) -> None:
                 same = next((f for f in old.get("files", []) if f.get("sha256") == sha and f.get("pixeldrain")), None)
                 entry["pixeldrain"] = same["pixeldrain"] if same else pixeldrain_upload(key, filename, blob)
                 entry["url"] = f"https://pixeldrain.com/u/{entry['pixeldrain']}"
-                for gone in old.get("files", []):
-                    if gone.get("pixeldrain") and gone["pixeldrain"] != entry["pixeldrain"]:
-                        log(f"bundles: the earlier copy of {gone['file']} is still on Pixeldrain as "
-                            f"{gone['pixeldrain']}; delete it there when convenient")
             files.append(entry)
+        # Earlier uploads this run replaced, plus any an earlier run could not delete.
+        now = {f.get("pixeldrain") for f in files}
+        superseded = [i for i in dict.fromkeys(
+            old.get("superseded", []) + [f["pixeldrain"] for f in old.get("files", []) if f.get("pixeldrain")])
+            if i not in now] if key else []
         unchanged = [f["sha256"] for f in old.get("files", [])] == [f["sha256"] for f in files]
         described.append({
             "id": name, "title": title, "minAverage": floor, "events": len(events),
             "updated": old["updated"] if unchanged and old.get("updated") else dt.date.today().isoformat(),
             "games": sum(ev["ctml_games"] for ev in events), "bytes": sum(f["bytes"] for f in files),
             "newest": max(ev["start"] for ev in events), "files": files,
+            **({"superseded": superseded} if superseded else {}),
         })
         log(f"bundles: {name}: {len(events)} events, {described[-1]['games']} games, "
             f"{described[-1]['bytes'] / 1e6:.0f} MB in {len(files)} file{'s' if len(files) != 1 else ''}")
@@ -3012,8 +3062,15 @@ def stage_bundles(con: sqlite3.Connection) -> None:
                     stale.unlink()   # generated files only: superseded parts, or bundles/ once Pixeldrain hosts them
             if folder != out_dir and not any(folder.iterdir()):
                 folder.rmdir()
-    BUNDLES_MANIFEST.write_text(json.dumps(described, ensure_ascii=False, indent=2) + "\n",
-                                encoding="utf-8", newline="\n")
+    def write_manifest():
+        BUNDLES_MANIFEST.write_text(json.dumps(described, ensure_ascii=False, indent=2) + "\n",
+                                    encoding="utf-8", newline="\n")
+
+    # The new links are on disk before anything old is removed.
+    write_manifest()
+    if key and any(bundle.get("superseded") for bundle in described):
+        pixeldrain_remove_superseded(key, described)
+        write_manifest()
     log(f"bundles: {BUNDLES_MANIFEST} ({time.time() - started:.0f}s)")
 
 

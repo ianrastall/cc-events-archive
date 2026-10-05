@@ -210,8 +210,10 @@ To host the databases on Pixeldrain instead, put an API key (from
 `PIXELDRAIN_API_KEY` environment variable. `bundles` then writes each database
 as a single ZIP under `work\bundles\`, uploads the ones that changed, records
 their Pixeldrain links in `cc_events_bundles.json`, and empties `bundles/` in
-the repository. A superseded upload is not deleted; its id is printed so it can
-be removed by hand.
+the repository. Once the new uploads are confirmed on Pixeldrain by size and
+SHA-256, the uploads they replace are deleted from the account. Only ids this
+file recorded as earlier uploads of these databases are ever deleted; one that
+cannot be deleted stays listed under `superseded` and is tried again next run.
 
 ## Known gaps
 
