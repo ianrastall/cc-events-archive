@@ -30,17 +30,21 @@ Run with the CTML project's interpreter, which has python-chess and lxml:
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import datetime as dt
 import hashlib
 import io
 import json
+import os
 import re
 import sqlite3
 import statistics
 import sys
 import time
 import unicodedata
+import urllib.error
+import urllib.request
 from collections import Counter, defaultdict
 from pathlib import Path
 from xml.sax.saxutils import escape as _xml_escape
@@ -51,7 +55,14 @@ HOME = REPO / "work"                                # catalog and generated CTML
 # finished files were moved to the first, the downloader is still writing to
 # the second, and the third is the folder named for them beside this repository.
 # A file present in two of them is taken from whichever copy is newer.
-INBOXES = [Path(r"D:\dev\proj\cc-events-download"), Path(r"D:\all\cc\events"), REPO.parent / "cc-events"]
+# Historical tournaments (1834-1989), one PGN per event, cut from a historical
+# database with PgnTools' Tour Breaker. They are not Chess.com files: their Elo
+# tags are Edo or Chessmetrics ratings and are trusted as they stand, nothing
+# is looked up for them, and their dates may be a bare year. Events scanned
+# from this folder carry origin = 'historical'.
+HISTORICAL_DIR = Path(r"D:\pgn\historical-tours")
+INBOXES = [Path(r"D:\dev\proj\cc-events-download"), Path(r"D:\all\cc\events"), REPO.parent / "cc-events",
+           HISTORICAL_DIR]
 OPENINGS_TSV = Path(r"D:\dev\proj\ctml\assets\all.tsv")   # ECO code and opening name by position
 ELYSIUM_DB = Path(r"D:\elysium\db\elysium.db")
 CTML_ROOT = Path(r"D:\dev\proj\ctml")
@@ -157,7 +168,7 @@ def log(msg: str) -> None:
 
 
 # Columns added after the first catalogs were built; applied to existing ones.
-MIGRATIONS = (("file", "dir", "text"), ("event", "site_tag", "text"), ("event", "pub_name", "text"), ("event", "byes", "integer"), ("event", "date_strays", "integer"), ("event", "ely_kind", "text"),
+MIGRATIONS = (("file", "dir", "text"), ("event", "site_tag", "text"), ("event", "origin", "text"), ("event", "pub_name", "text"), ("event", "byes", "integer"), ("event", "date_strays", "integer"), ("event", "ely_kind", "text"),
               ("event", "identity_doubt", "text"), ("player", "doubt", "text"),
               ("player", "in_roster", "integer"),
               # crosstable stage
@@ -331,6 +342,8 @@ def scan_file(path: Path) -> dict | None:
     players: dict[str, _Player] = {}
     name_to_fide: dict[str, set[str]] = defaultdict(set)
     names, site_slugs, tcs, sites = Counter(), Counter(), Counter(), Counter()
+    partial_dates = set()
+    event_rounds, event_types = Counter(), Counter()
     game_dates, rounds, url_rounds = [], set(), set()
     pairs: Counter = Counter()
     unfinished = fen_games = team_games = board_games = clock_games = byes = 0
@@ -350,12 +363,19 @@ def scan_file(path: Path) -> dict | None:
             if m:
                 url_rounds.add(m.group(1) or m.group(2))
         d = valid_date(t.get("Date", ""))
+        m = re.fullmatch(r"(\d{4})\.(\d\d|\?\?)\.(?:\d\d|\?\?)", t.get("Date", ""))
+        if m and 1000 < int(m.group(1)) < 2100:
+            partial_dates.add(m.group(1) + ("" if m.group(2) == "??" else "-" + m.group(2)))
         if d:
             # EndDate counts only when it is the same game finishing: a stray
             # EndDate years later is the day Chess.com touched the record.
             e = valid_date(t.get("EndDate", ""))
             late = (dt.date.fromisoformat(e) - dt.date.fromisoformat(d)).days if e else -1
             game_dates.append((d, e if 0 <= late <= 3 else d))
+        if t.get("EventRounds", "").isdigit() and int(t["EventRounds"]) > 0:
+            event_rounds[int(t["EventRounds"])] += 1
+        if t.get("EventType"):
+            event_types[t["EventType"].split("(")[0].strip().lower()] += 1
         rnd = t.get("Round", "")
         if rnd and rnd not in ("?", "-"):
             rounds.add(rnd.split(".")[0])
@@ -455,6 +475,25 @@ def scan_file(path: Path) -> dict | None:
         tag_start = main[0]
         tag_end = max(e for d, e in game_dates if main[0] <= d <= main[-1])
         strays = sum(per_day[day] for run in runs if run is not main for day in run)
+    elif partial_dates:
+        # No game has a full date ("1977.??.??", "1988.06.??"): the event is
+        # dated to the month if every game names the same one, else to the year(s).
+        if len(partial_dates) == 1 and len(next(iter(partial_dates))) == 7:
+            tag_start = tag_end = next(iter(partial_dates))
+        else:
+            years = sorted({value[:4] for value in partial_dates})
+            tag_start, tag_end = years[0], years[-1]
+
+    if path.parent == HISTORICAL_DIR:
+        # A historical file holds only the games between its strongest players
+        # (the collection it was cut from keeps games where both sides are
+        # rated 2400 or more), so the pairings present say nothing about the
+        # event's format. Its EventType tag does.
+        kind = event_types.most_common(1)[0][0] if event_types else ""
+        fmt = ("team" if kind.startswith("team") else
+               {"tourn": "round-robin", "match": "match", "swiss": "swiss", "k.o.": "knockout",
+                "ko": "knockout"}.get(kind))
+        note = f"EventType tag: {kind}" if kind else None
 
     stem = path.stem
     slug_years = sorted(set(re.findall(r"(?<!\d)(1[89]\d\d|20[0-3]\d)(?!\d)", stem)))
@@ -466,7 +505,9 @@ def scan_file(path: Path) -> dict | None:
             "slug": stem, "file": path.name, "name": names.most_common(1)[0][0],
             "site_slug": site_slugs.most_common(1)[0][0] if site_slugs else None,
             "site_tag": site_place(sites),
-            "games": len(chunks) - byes, "byes": byes, "players": n, "rounds": len(rounds) or len(url_rounds) or None,
+            "games": len(chunks) - byes, "byes": byes, "players": n,
+            "rounds": (len(rounds) or len(url_rounds)
+                       or (event_rounds.most_common(1)[0][0] if event_rounds else None)),
             "tag_start": tag_start, "tag_end": tag_end, "date_strays": strays,
             "slug_years": ",".join(slug_years) or None,
             "unfinished": unfinished, "fen_games": fen_games, "team_games": team_games,
@@ -542,6 +583,8 @@ def stage_scan(con: sqlite3.Connection, inboxes: list[Path], limit: int | None =
         else:
             try:
                 result = scan_file(path)
+                if result and path.parent == HISTORICAL_DIR:
+                    result["event"]["origin"] = "historical"
                 if result is None:
                     status = "no-games"
             except Exception as exc:  # keep going; the file is reported, not lost
@@ -719,9 +762,11 @@ def stage_enrich(con: sqlite3.Connection, limit: int | None = None) -> None:
     started = time.time()
     for i, ev in enumerate(events, 1):
         hay = norm_name(f"{ev['slug']} {ev['name']}")
-        if ENGINE_PATTERN.search(hay) or any(pat.search(hay) for pat in SERIES_PATTERNS.values()):
+        if (ev["origin"] == "historical" or ENGINE_PATTERN.search(hay)
+                or any(pat.search(hay) for pat in SERIES_PATTERNS.values())):
             # Titled Tuesday and the like are set aside by name; their hundreds
-            # of players per file are not worth looking up.
+            # of players per file are not worth looking up. Historical events
+            # are taken as their own PGN states them.
             con.execute("update event set enriched = 1, date_suspect = 0, elo_suspect = 0 where slug = ?",
                         (ev["slug"],))
             continue
@@ -964,6 +1009,7 @@ def stage_match(con: sqlite3.Connection, limit: int | None = None) -> None:
         except (TypeError, ValueError):
             return 0
 
+    con.execute("update event set matched = 1 where matched = 0 and origin = 'historical'")
     events = con.execute(
         "select * from event where matched = 0 and enriched = 1 order by coalesce(tag_start, ''), slug").fetchall()
     if limit:
@@ -1262,6 +1308,7 @@ def stage_tables(con: sqlite3.Connection, limit: int | None = None) -> None:
     if not build_table_index(con):
         return
     rosters: dict[int, Roster] = {}
+    con.execute("update event set xt_done = 1 where xt_done = 0 and origin = 'historical'")
     events = con.execute(
         "select * from event where xt_done = 0 and enriched = 1 order by coalesce(tag_start, ''), slug").fetchall()
     if limit:
@@ -1489,11 +1536,14 @@ def stage_classify(con: sqlite3.Connection) -> None:
         covered = bool(ev["rating_month"]) and ev["rating_month"] <= ELYSIUM_LAST_MONTH
         tags_standard = int(not ev["elo_suspect"] and len(both) >= 4
                             and sum(d <= (5 if covered else 100) for d in both) >= 0.8 * len(both))
+        historical = ev["origin"] == "historical"
+        if historical:
+            tags_standard = 1  # Edo / Chessmetrics ratings, trusted as tagged
         ev = {**dict(ev), "tags_standard": tags_standard}
         rated = [(p, *rating_for(ev, p, ignore_doubt=True)) for p in players]
         values = [v for _, v, _ in rated if v]
         doubts: dict[str, str] = {}
-        if values and len(players) <= 20:
+        if values and len(players) <= 20 and not historical:
             field = max(values) if len(values) <= 3 else statistics.median(values)
             if field >= 2400:
                 for p, value, _ in rated:
@@ -1549,15 +1599,16 @@ def stage_classify(con: sqlite3.Connection) -> None:
             else:
                 unknown += 1
 
-        hay = norm_name(f"{ev['slug']} {ev['name']}")
-        series = next((label for label, pat in SERIES_PATTERNS.items() if pat.search(hay)), None)
+        hay = norm_name(ev["name"] if historical else f"{ev['slug']} {ev['name']}")
+        series = None if historical else next(
+            (label for label, pat in SERIES_PATTERNS.items() if pat.search(hay)), None)
         if series:
             decision, reason = "series", f"{series} has its own archive"
-        elif ENGINE_PATTERN.search(hay):
+        elif not historical and ENGINE_PATTERN.search(hay):
             decision, reason = "engine", "engine event"
-        elif TEST_PATTERN.search(hay):
+        elif not historical and TEST_PATTERN.search(hay):
             decision, reason = "test", "a broadcast test, not an event"
-        elif ratings and max(ratings) > 2900:
+        elif not historical and ratings and max(ratings) > 2900:
             decision, reason = "engine", f"a participant is rated {max(ratings)}: an engine"
         elif avg is None:
             decision, reason = "review", "no ratings in the PGN or in Elysium"
@@ -1589,6 +1640,15 @@ def stage_classify(con: sqlite3.Connection) -> None:
         display = ev["xt_name"] if table_ok and ev["xt_name"] else ev["name"]
         # "... Live", "... Secret": Chess.com's label for the copy, not part of the event's name.
         display = re.sub(r"(\s+(Live|Secret|Broadcast))+$", "", display, flags=re.I) or display
+        if historical and start:
+            # Some files carry another event's name: "31st Swiss Chess
+            # Association Championship - Biel 1927" on a Biel event of 1977.
+            # A name whose every year is off by more than one from the games'
+            # is not this event's; the town and year stand in for it.
+            named = [int(y) for y in re.findall(r"(?<!\d)(1[89]\d\d)(?!\d)", display)]
+            if named and all(abs(y - int(start[:4])) > 1 for y in named):
+                town = re.sub(r"\s+[A-Z]{3}$", "", re.sub(r"\([^)]*\)", "", ev["site_tag"] or "").strip())
+                display = f"{town or 'Tournament'} {start[:4]}"
         con.execute(
             "update event set rated_players = ?, backfilled_players = ?, avg_rating = ?, avg_basis = ?, "
             "avg_computed = ?, min_rating = ?, max_rating = ?, below_floor = ?, category = ?, decision = ?, "
@@ -1626,7 +1686,7 @@ def file_slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
 
 
-def place_slug(place: str | None) -> str:
+def place_slug(place: str | None, fallback: str = "chess-com") -> str:
     """The town in a place string, as a filename part: 'Saint Louis USA' and
     'Saint Louis, US' -> 'saint-louis'; 'Hotel Habana Libre, La Habana, CU' ->
     'la-habana'. An online host -> 'chess-com' and the like; and with no place
@@ -1641,17 +1701,22 @@ def place_slug(place: str | None) -> str:
         parts.pop()                                              # 'Napoli, IT', 'xinghua, China'
     parts = [re.sub(r"\s+[A-Z]{3}$", "", part) for part in parts]  # 'Warsaw POL', 'Van Nuys, CA USA'
     towns = [part for part in parts if not VENUE_WORDS.search(part) and file_slug(part)]
-    return file_slug(towns[0] if towns else (parts[0] if parts else "")) or "chess-com"
+    return file_slug(towns[0] if towns else (parts[0] if parts else "")) or (fallback if place is None or not text else "chess-com")
 
 
-def publish_name(start: str, place: str | None, name: str, slug: str) -> str:
+def publish_name(start: str, place: str | None, name: str, slug: str, fallback: str = "chess-com",
+                 dedupe: bool = False) -> str:
     """YYYY-MM-DD-site-event. An unknown month or day is 00. The event part is
     the name without the year the date already gives."""
     words = [w for w in file_slug(name).split("-") if w != start[:4]]
+    town = place_slug(place, fallback).split("-")
+    if dedupe and words[:len(town)] == town:
+        # "Kiev" at Kiev, "Lodz Makarczyk Memorial" at Lodz: the site already says it.
+        words = words[len(town):] or ["tournament"]
     while len(words) > 1 and words[-1] in ("live", "secret", "broadcast"):
         words.pop()   # Chess.com's label for a copy of the event, not part of its name
     event = "-".join(words) or "-".join(w for w in file_slug(slug).split("-") if w != start[:4]) or "event"
-    return f"{(start + '-00-00')[:10]}-{place_slug(place)}-{event}"
+    return f"{(start + '-00-00')[:10]}-{place_slug(place, fallback)}-{event}"
 
 
 def twin_base(slug: str) -> str:
@@ -1688,12 +1753,17 @@ def assign_publish_names(con: sqlite3.Connection) -> None:
     def place(ev):
         return (ev["xt_place"] if ev["xt_id"] and ev["xt_name_ok"] else None) or ev["ely_place"] or ev["site_tag"]
 
-    names = {ev["slug"]: publish_name(ev["start"], place(ev), ev["display_name"] or ev["name"], ev["slug"])
-             for ev in events}
+    def named(ev, name):
+        historical = ev["origin"] == "historical"
+        # A historical file's own name ends in a hash; it is no fallback for the event's name.
+        return publish_name(ev["start"], place(ev), name, "event" if historical else ev["slug"],
+                            "unknown" if historical else "chess-com", dedupe=historical)
+
+    names = {ev["slug"]: named(ev, ev["display_name"] or ev["name"]) for ev in events}
     shared = {name for name, n in Counter(names.values()).items() if n > 1}
     for ev in events:
-        if names[ev["slug"]] in shared:
-            names[ev["slug"]] = publish_name(ev["start"], place(ev), ev["name"], ev["slug"])
+        if names[ev["slug"]] in shared and ev["origin"] != "historical":
+            names[ev["slug"]] = named(ev, ev["name"])
     taken: Counter = Counter()
     con.execute("update event set pub_name = null")
     for ev in events:
@@ -1754,7 +1824,7 @@ def event_signature(ev: sqlite3.Row, file_sig: tuple) -> str:
     keys = ("name", "start", "end", "date_basis", "avg_rating", "avg_basis", "category", "format",
             "ely_event_id", "ely_place", "ely_name", "elo_suspect", "date_suspect", "rating_month",
             "identity_doubt", "display_name", "xt_id", "xt_name_ok", "xt_rows", "xt_final", "avg_computed",
-            "tags_standard", "xt_fit", "xt_pool", "xt_place", "xt_country", "xt_rounds", "site_tag")
+            "tags_standard", "xt_fit", "xt_pool", "xt_place", "xt_country", "xt_rounds", "site_tag", "origin")
     blob = json.dumps([VERSION, file_sig, [ev[k] for k in keys]], default=str)
     return hashlib.sha1(blob.encode()).hexdigest()
 
@@ -1825,8 +1895,10 @@ def build_ctml(ev: dict, players: list[dict], source: Path, fp_scheme, fp_cls) -
     for p in players:
         by_name.setdefault(norm_name(p["name"]), p["key"])
 
+    historical = ev["origin"] == "historical"
     site_slug = ev["site_slug"] or ev["slug"]
-    event_uri = f"https://www.chess.com/events/{site_slug}"
+    event_uri = None if historical else f"https://www.chess.com/events/{site_slug}"
+    pgn_label = "historical tournament PGN" if historical else "Chess.com event PGN"
     start, end = ev["start"], ev["end"]
     date_raw = None
     if ev["date_basis"] == "rating-list-month":
@@ -1848,7 +1920,8 @@ def build_ctml(ev: dict, players: list[dict], source: Path, fp_scheme, fp_cls) -
          f'<ctml:tournament xmlns:ctml="{CTML_NS}" ctmlVersion="2.1" id="t-{esc(re.sub(r"[^A-Za-z0-9._-]", "-", ev["slug"]))}">',
          "  <ctml:header>",
          f"    <ctml:name>{esc(ev['display_name'] or ev['name'])}</ctml:name>",
-         f'    <ctml:eventRef ref="event:{compact(start)}-{compact(end)}-{esc(ev["slug"])}" source="{esc(event_uri)}">'
+         f'    <ctml:eventRef ref="event:{compact(start)}-{compact(end)}-{esc(ev["slug"])}"'
+         + (f' source="{esc(event_uri)}"' if event_uri else "") + ">"
          f"<ctml:name>{esc(ev['name'])}</ctml:name></ctml:eventRef>"]
     if ev["format"]:
         L.append(f"    <ctml:eventType>{ev['format']}</ctml:eventType>")
@@ -1865,7 +1938,7 @@ def build_ctml(ev: dict, players: list[dict], source: Path, fp_scheme, fp_cls) -
         L.append(f"    <ctml:rounds>{ev['xt_rounds']}</ctml:rounds>")
     if ev["avg_rating"]:
         basis = ev["avg_basis"] or ""
-        system = "combined" if "elysium" in basis and not basis.startswith("elysium:") else "fide"
+        system = "combined" if historical or ("elysium" in basis and not basis.startswith("elysium:")) else "fide"
         cat = f' category="{ev["category"]}"' if ev["category"] else ""
         L.append(f'    <ctml:averageRating system="{system}" scope="standard"{cat}>{ev["avg_rating"]}</ctml:averageRating>')
     L += ["  </ctml:header>", "  <ctml:participants>"]
@@ -1914,10 +1987,15 @@ def build_ctml(ev: dict, players: list[dict], source: Path, fp_scheme, fp_cls) -
             L.append(f'      <ctml:ratingSnapshot system="fide" scope="standard"><ctml:value>{rating}</ctml:value>'
                      f"{asof}<ctml:publishedForEvent>true</ctml:publishedForEvent></ctml:ratingSnapshot>")
         elif rating_source == "pgn":
-            asof = (f"<ctml:asOf>{date_element(asof_month, 'Elo tag in the Chess.com PGN')}</ctml:asOf>"
-                    if asof_month else "")
-            L.append(f'      <ctml:ratingSnapshot system="fide" scope="standard"><ctml:value>{rating}</ctml:value>'
-                     f"{asof}<ctml:publishedForEvent>true</ctml:publishedForEvent></ctml:ratingSnapshot>")
+            if historical:
+                # An Edo or Chessmetrics rating (the file does not say which), not one published for the event.
+                L.append(f'      <ctml:ratingSnapshot system="combined" scope="standard"><ctml:value>{rating}</ctml:value>'
+                         f"</ctml:ratingSnapshot>")
+            else:
+                asof = (f"<ctml:asOf>{date_element(asof_month, 'Elo tag in the Chess.com PGN')}</ctml:asOf>"
+                        if asof_month else "")
+                L.append(f'      <ctml:ratingSnapshot system="fide" scope="standard"><ctml:value>{rating}</ctml:value>'
+                         f"{asof}<ctml:publishedForEvent>true</ctml:publishedForEvent></ctml:ratingSnapshot>")
         elif rating_source == "elysium":
             L.append(f'      <ctml:ratingSnapshot system="combined" scope="standard"><ctml:value>{rating}</ctml:value>'
                      f"<ctml:asOf>{date_element(p['elo_ely_period'], 'Elysium monthly rating for the event month')}</ctml:asOf>"
@@ -2060,9 +2138,12 @@ def build_ctml(ev: dict, players: list[dict], source: Path, fp_scheme, fp_cls) -
         L += ["    <ctml:nonGames>", *non_games, "    </ctml:nonGames>"]
     L.append("  </ctml:games>")
 
-    notes = [f"Partial record generated by {VERSION} from the Chess.com event PGN; it states only what that PGN, "
+    notes = [f"Partial record generated by {VERSION} from the {pgn_label}; it states only what that PGN, "
              "the published crosstables and the Elysium workbench supply. Rounds, cadence, organizers, "
              "standings and place are absent unless given above."]
+    if historical:
+        notes.append("Ratings are the Elo tags of the source PGN: Edo or Chessmetrics historical ratings, not "
+                     "FIDE ratings. Annotations and variations in the source are not carried over.")
     if ev["xt_id"]:
         relation = {"same": "the same field", "whole": "a larger field containing this one",
                     "part": "part of this field"}[ev["xt_kind"]]
@@ -2099,8 +2180,12 @@ def build_ctml(ev: dict, players: list[dict], source: Path, fp_scheme, fp_cls) -
     if ev["xt_id"]:
         L.append(f'  <ctml:source kind="{esc(ev["xt_source"])}"><ctml:note>'
                  + esc(f"{table_label}: {ev['xt_title']}; {ev['xt_obs']}") + "</ctml:note></ctml:source>")
-    L.append(f'  <ctml:source kind="chesscom-events"><ctml:uri>{esc(event_uri)}</ctml:uri>'
-             f"<ctml:retrieved>{dt.date.fromtimestamp(source.stat().st_mtime).isoformat()}</ctml:retrieved></ctml:source>")
+    if historical:
+        L.append('  <ctml:source kind="historical-collection"><ctml:note>'
+                 + esc(f"{source.name}, one event cut from a historical game collection") + "</ctml:note></ctml:source>")
+    else:
+        L.append(f'  <ctml:source kind="chesscom-events"><ctml:uri>{esc(event_uri)}</ctml:uri>'
+                 f"<ctml:retrieved>{dt.date.fromtimestamp(source.stat().st_mtime).isoformat()}</ctml:retrieved></ctml:source>")
     L.append("</ctml:tournament>")
     return "\n".join(L) + "\n", written, errors
 
@@ -2243,7 +2328,8 @@ def ctml_to_pgn(ctml_path: Path) -> tuple[str, int]:
     # The real place wherever it is known. Otherwise the event's only known
     # home is the site that hosted its broadcast.
     site = place.findtext(q("name")) if place is not None else None
-    site = (f"{site} {country}" if country else site) if site else "Chess.com"
+    from_chesscom = any(src.get("kind") == "chesscom-events" for src in root.findall(q("source")))
+    site = (f"{site} {country}" if country else site) if site else ("Chess.com" if from_chesscom else "?")
     event_type = header.findtext(q("eventType"))
     avg = header.find(q("averageRating"))
     category = avg.get("category") if avg is not None else None
@@ -2548,6 +2634,7 @@ def stage_publish(con: sqlite3.Connection, workers: int = WORKERS) -> None:
         entry = {
             "slug": slug, "zip": f"{slug}.zip", "pgn": f"{slug}.pgn", "ctml": f"{slug}.ctml",
             "sourceSlug": ev["slug"],
+            "historical": True if ev["origin"] == "historical" else None,
             "year": year, "start": first, "end": last,
             "name": ev["display_name"] or ev["name"], "sourceName": ev["name"],
             "place": (ev["xt_place"] if firm else None) or ev["ely_place"] or ev["site_tag"] or "",
@@ -2602,6 +2689,36 @@ BUNDLES = (("cc-events-all", 0, "Every event in the archive"),
            ("cc-events-2600", 2600, "Events with a tournament average of 2600 or more"),
            ("cc-events-2700", 2700, "Events with a tournament average of 2700 or more"))
 BUNDLE_PART_BYTES = 95_000_000   # GitHub refuses files over 100 MB; a bigger database is split by year
+# With a Pixeldrain API key the databases are uploaded there instead: one file
+# each, nothing split, nothing committed to this repository. The key is read
+# from the PIXELDRAIN_API_KEY environment variable or from work/pixeldrain.key
+# (work/ is not committed). Without a key they go into bundles/ as above.
+PIXELDRAIN_API = "https://pixeldrain.com/api"
+
+
+def pixeldrain_key() -> str | None:
+    key = os.environ.get("PIXELDRAIN_API_KEY", "").strip()
+    key_file = HOME / "pixeldrain.key"
+    if not key and key_file.is_file():
+        key = key_file.read_text(encoding="utf-8").strip()
+    return key or None
+
+
+def pixeldrain_upload(key: str, filename: str, blob: bytes) -> str:
+    """PUT one file to Pixeldrain; returns its id. Raises on any failure."""
+    request = urllib.request.Request(
+        f"{PIXELDRAIN_API}/file/{urllib.request.quote(filename)}", data=blob, method="PUT",
+        headers={"Authorization": "Basic " + base64.b64encode(f":{key}".encode()).decode(),
+                 "Content-Type": "application/octet-stream"})
+    try:
+        with urllib.request.urlopen(request, timeout=1800) as response:
+            reply = json.load(response)
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", "replace")[:300]
+        raise RuntimeError(f"Pixeldrain refused {filename}: HTTP {error.code} {detail}") from None
+    if not reply.get("id"):
+        raise RuntimeError(f"Pixeldrain returned no id for {filename}: {reply}")
+    return reply["id"]
 
 
 def _bundle_zip(name: str, members: list[tuple[str, list]]) -> tuple[bytes, int]:
@@ -2628,7 +2745,9 @@ def stage_bundles(con: sqlite3.Connection) -> None:
     kept = con.execute(
         "select * from event where decision = 'keep' and ctml_valid = 1 and pgn_path is not null "
         "and pgn_sig is not null order by start, slug").fetchall()
-    BUNDLE_DIR.mkdir(exist_ok=True)
+    key = pixeldrain_key()
+    out_dir = HOME / "bundles" if key else BUNDLE_DIR
+    out_dir.mkdir(exist_ok=True)
     described, written = [], set()
     # "updated" is the day a database last changed, not the day this ran.
     before = {}
@@ -2638,7 +2757,7 @@ def stage_bundles(con: sqlite3.Connection) -> None:
         events = [ev for ev in kept if ev["avg_rating"] >= floor]
         data, _ = _bundle_zip(name, [(f"{name}.pgn", events)])
         parts = [(f"{name}.zip", data, events)]
-        if len(data) > BUNDLE_PART_BYTES:
+        if len(data) > BUNDLE_PART_BYTES and not key:
             # Split at year boundaries into as few parts as fit under the limit.
             by_year: dict[str, list] = defaultdict(list)
             for ev in events:
@@ -2658,18 +2777,29 @@ def stage_bundles(con: sqlite3.Connection) -> None:
                 run.append(year)
             parts.append(close(run))
         files = []
+        old = before.get(name, {})
         for filename, blob, part_events in parts:
-            target = BUNDLE_DIR / filename
+            target = out_dir / filename
             if not target.exists() or target.read_bytes() != blob:
                 target.write_bytes(blob)
             written.add(filename)
-            files.append({
-                "file": filename, "bytes": len(blob), "sha256": hashlib.sha256(blob).hexdigest(),
+            sha = hashlib.sha256(blob).hexdigest()
+            entry = {
+                "file": filename, "bytes": len(blob), "sha256": sha,
                 "events": len(part_events), "games": sum(ev["ctml_games"] for ev in part_events),
                 "from": part_events[0]["start"][:4], "to": part_events[-1]["start"][:4],
                 "url": f"https://github.com/{GITHUB_REPO}/raw/main/bundles/{filename}",
-            })
-        old = before.get(name, {})
+            }
+            if key:
+                # Upload only what changed; an unchanged database keeps its link.
+                same = next((f for f in old.get("files", []) if f.get("sha256") == sha and f.get("pixeldrain")), None)
+                entry["pixeldrain"] = same["pixeldrain"] if same else pixeldrain_upload(key, filename, blob)
+                entry["url"] = f"https://pixeldrain.com/u/{entry['pixeldrain']}"
+                for gone in old.get("files", []):
+                    if gone.get("pixeldrain") and gone["pixeldrain"] != entry["pixeldrain"]:
+                        log(f"bundles: the earlier copy of {gone['file']} is still on Pixeldrain as "
+                            f"{gone['pixeldrain']}; delete it there when convenient")
+            files.append(entry)
         unchanged = [f["sha256"] for f in old.get("files", [])] == [f["sha256"] for f in files]
         described.append({
             "id": name, "title": title, "minAverage": floor, "events": len(events),
@@ -2679,9 +2809,13 @@ def stage_bundles(con: sqlite3.Connection) -> None:
         })
         log(f"bundles: {name}: {len(events)} events, {described[-1]['games']} games, "
             f"{described[-1]['bytes'] / 1e6:.0f} MB in {len(files)} file{'s' if len(files) != 1 else ''}")
-    for stale in BUNDLE_DIR.glob("*.zip"):
-        if stale.name not in written:
-            stale.unlink()
+    for folder in {out_dir, BUNDLE_DIR}:
+        if folder.is_dir():
+            for stale in folder.glob("*.zip"):
+                if folder != out_dir or stale.name not in written:
+                    stale.unlink()   # generated files only: superseded parts, or bundles/ once Pixeldrain hosts them
+            if folder != out_dir and not any(folder.iterdir()):
+                folder.rmdir()
     BUNDLES_MANIFEST.write_text(json.dumps(described, ensure_ascii=False, indent=2) + "\n",
                                 encoding="utf-8", newline="\n")
     log(f"bundles: {BUNDLES_MANIFEST} ({time.time() - started:.0f}s)")
@@ -2692,7 +2826,7 @@ def stage_bundles(con: sqlite3.Connection) -> None:
 # --------------------------------------------------------------------------
 
 EXPORT_COLUMNS = (
-    "slug", "pub_name", "display_name", "name", "decision", "reason", "start", "end", "date_basis",
+    "slug", "pub_name", "origin", "display_name", "name", "decision", "reason", "start", "end", "date_basis",
     "avg_rating", "category", "avg_basis", "avg_computed",
     "xt_place", "site_tag", "xt_country", "xt_rounds", "xt_kind", "xt_score", "xt_name_ok", "xt_source", "xt_ref",
     "xt_title", "xt_start", "xt_end", "xt_category", "xt_avg", "xt_final", "xt_fit", "xt_rows",

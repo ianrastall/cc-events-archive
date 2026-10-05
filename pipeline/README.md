@@ -196,6 +196,14 @@ boundaries (`cc-events-all-1972-2021.zip`, ...). `cc_events_bundles.json` lists
 them; the site's PGN Downloads page and Events tab are built from it. Commit
 `bundles/` and that file with every publish.
 
+To host the databases on Pixeldrain instead, put an API key (from
+<https://pixeldrain.com/user/api_keys>) in `work\pixeldrain.key` or in the
+`PIXELDRAIN_API_KEY` environment variable. `bundles` then writes each database
+as a single ZIP under `work\bundles\`, uploads the ones that changed, records
+their Pixeldrain links in `cc_events_bundles.json`, and empties `bundles/` in
+the repository. A superseded upload is not deleted; its id is printed so it can
+be removed by hand.
+
 ## Known gaps
 
 - World Championship matches have only a schedule table in TWIC, so they get no
