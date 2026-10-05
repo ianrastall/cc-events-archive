@@ -4,8 +4,11 @@
 and a clean PGN for every event that passes the strength test, and the ZIPs and
 manifest this repository publishes.
 
-**The test:** tournament average of 2300 or more, and no player below 2000, both
-on FIDE standard ratings at the time of the event.
+**The test:** tournament average of 2300 or more, and no player below 2200, both
+on FIDE standard ratings at the time of the event. An event with more than 200
+players (an Olympiad, a World Cup, a big open) only has to meet the average.
+The Olympiads themselves (open and women's, not the youth, disabled or online
+ones) are kept by name whatever their average.
 
 ## Run it
 
@@ -82,7 +85,8 @@ have four recurring faults. The catalog records each per event.
 
 ## What each stage decides
 
-**scan** — per file: name, dates, rounds, players, per-player Elo, title and
+**scan** — per file: name, the place its Site tags name (`site_tag`; files from
+2024 on state the venue there, older ones hold only a Chess.com URL), dates, rounds, players, per-player Elo, title and
 FIDE id, teams, boards, whether the clocks are real, and whether the pairings
 form a complete round robin (`format`: `round-robin`, `match`, `team`, or empty).
 A few games dated months from the rest (`date_strays`) do not stretch the dates.
@@ -92,7 +96,8 @@ rating for the event month from Elysium. Sets `elo_suspect` and `date_suspect`.
 Series events (Titled Tuesday and the like) are skipped.
 
 **match** — finds the event among Elysium's event records by start date and
-roster. Used for the place, and for an independent average to cross-check.
+roster. Where Elysium has no participant list for an event (all of GigaKing and
+Mega), its roster is the names printed on the event's games. Used for the place, and for an independent average to cross-check.
 
 **tables** — finds the event's own crosstable by date overlap and roster.
 Catalog columns start `xt_`.
@@ -136,10 +141,12 @@ category (category 1 starts at 2251, 25 points each).
 
 | Decision | Meaning |
 | --- | --- |
-| `keep` | average 2300 or more and no known rating below 2000 |
-| `cull` | average below 2300, or a player below 2000 |
+| `keep` | average 2300 or more and no known rating below 2200 (the floor is waived above 200 players) |
+| `cull` | average below 2300, or a player below 2200 in a field of 200 or fewer |
 | `review` | fewer than half the players have a usable rating, or the average and Elysium's crosstable average fall on opposite sides of 2300 |
 | `engine` | TCEC, or a participant rated above 2900 |
+| `twin` | a "-live", "-secret" or "-broadcast" copy of an event that is kept; of the copies, the one with the most games stays |
+| `test` | Chess.com broadcast rehearsals: "Cbtest", "Test Event", "Trial Knockout" and the like |
 | `series` | Titled Tuesday, Bullet Brawl, 3-0 Thursday, CCC: they have their own archives |
 
 A missing rating is not a zero: the floor and the average use known ratings
@@ -163,8 +170,19 @@ FIDE ids, titles, teams, boards, clock comments where real, and the Chess.com
 game URL in `Link`, plus `ECO` and `Opening`. `Site` is the real place as
 "City FED" wherever it is known, and `Chess.com` otherwise.
 
+**File names** — every kept event is published as `YYYY-MM-DD-site-event`
+(`2023-06-03-saint-louis-3rd-cairns-cup.zip`, holding the `.pgn` and `.ctml` of
+the same name): the start date (00 for an unknown month or day), the town of
+the place, or `chess-com` for an online event or one with no venue on record,
+and the event's name without its year. `classify` assigns them (`pub_name`);
+two events that would share a name fall back to Chess.com's own names for them.
+The manifest's `slug` is this name and `sourceSlug` is Chess.com's.
+
 **publish** — one ZIP per kept event holding the PGN and the CTML, with a fixed
 timestamp so an unchanged event produces identical bytes, and the manifest.
+In the manifest, `place` is the crosstable's, else Elysium's, else the Site
+tag's; `rounds` is the crosstable's scheduled rounds, else the number of
+distinct rounds in the games.
 Entries already in the manifest from the earlier collection are carried over as
 `"legacy": true` until their slug has been scanned here; ZIPs the manifest no
 longer lists are deleted.

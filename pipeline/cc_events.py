@@ -12,7 +12,7 @@ cc_events_manifest.json. Nothing here commits or pushes.
     match      find the event among Elysium's event records: place
     tables     find the event's own crosstable: name, dates, place, rounds,
                category, and each player's title, federation, rating and score
-    classify   tournament average, FIDE category, the 2000 floor, keep / cull
+    classify   tournament average, FIDE category, the 2200 floor, keep / cull
     ctml       write and validate a CTML document for every kept event
     pgn        write PGN back out of the CTML
     export     work/catalog.csv
@@ -67,7 +67,8 @@ PGN_OUT = HOME / "pgn"
 VERSION = "cc-events-pipeline/5"
 CTML_NS = "urn:ctml:2.0"
 KEEP_AVERAGE = 2300          # ChessBase's "strong tournament" line
-RATING_FLOOR = 2000          # and no participant below this
+RATING_FLOOR = 2200          # and no participant below this ...
+FLOOR_EXEMPT_PLAYERS = 200   # ... unless the field is larger than this (Olympiads, World Cups, big opens)
 ELYSIUM_LAST_MONTH = "2025-12"   # last monthly list in elysium.db; later events lean on their Elo tags
 MIN_RATED_SHARE = 0.5        # below this the average is not trusted -> review
 SETTLE_SECONDS = 120         # ignore files the downloader touched this recently
@@ -84,6 +85,15 @@ SERIES_PATTERNS = {
     "3-0 Thursday": re.compile(r"3\s*0\s*thursday"),
     "CCC": re.compile(r"computer\s*chess\s*championship|\bccc\b|\bcccc\b"),
 }
+TEST_PATTERN = re.compile(r"\bcbtest|\btest\b|\btrial knockout\b|\bcb ugly\b")   # Chess.com's broadcast rehearsals
+# The Olympiads (open and women's) are kept whatever their average: the user's
+# call, 2026-10-05. Not the youth, disabled or online Olympiads, which are
+# smaller events and are judged like any other.
+OLYMPIAD_PATTERN = re.compile(r"\bolympiad\b")
+OLYMPIAD_EXCLUDED = re.compile(r"\byouth\b|\bu\d\d\b|\bdisabilit|\bschool|\bjunior|\bonline\b")
+# Chess.com often carries one event under two or three ids: the event, and a
+# "-live", "-secret" or "-broadcast" copy of it. Only one is kept.
+TWIN_SUFFIX = re.compile(r"-(live|secret|broadcast|tv\d?)$", re.I)
 ENGINE_PATTERN = re.compile(r"\btcec|\bkomodo\b|\bstockfish\b|\bleela\b|\blc0\b")
 TIME_CONTROL_RE = re.compile(r"\d{2,}(\+\d+)?(:\d+(\+\d+)?)*|\d+/\d+.*")  # "1" is not a time control
 NAME_PRIORITY = {"twic": 0, "olimpbase": 1, "chess-results": 2, "mega26": 3, "gigaking": 4}
@@ -113,7 +123,7 @@ create table if not exists event(
     ely_avg integer, ely_avg_n integer,
     start text, end text, date_basis text,
     rated_players integer, backfilled_players integer, avg_rating integer, avg_basis text,
-    min_rating integer, max_rating integer, below_2000 integer,
+    min_rating integer, max_rating integer, below_floor integer,
     category integer, decision text, reason text,
     ctml_path text, ctml_sig text, ctml_valid integer, ctml_games integer,
     ctml_bytes integer, parse_errors integer, pgn_path text, pgn_sig text);
@@ -146,7 +156,7 @@ def log(msg: str) -> None:
 
 
 # Columns added after the first catalogs were built; applied to existing ones.
-MIGRATIONS = (("file", "dir", "text"), ("event", "byes", "integer"), ("event", "date_strays", "integer"), ("event", "ely_kind", "text"),
+MIGRATIONS = (("file", "dir", "text"), ("event", "site_tag", "text"), ("event", "pub_name", "text"), ("event", "byes", "integer"), ("event", "date_strays", "integer"), ("event", "ely_kind", "text"),
               ("event", "identity_doubt", "text"), ("player", "doubt", "text"),
               ("player", "in_roster", "integer"),
               # crosstable stage
@@ -170,6 +180,8 @@ def open_catalog() -> sqlite3.Connection:
     con = sqlite3.connect(CATALOG, timeout=60)
     con.row_factory = sqlite3.Row
     con.executescript(SCHEMA)
+    if "below_2000" in {r["name"] for r in con.execute("pragma table_info(event)")}:
+        con.execute("alter table event rename column below_2000 to below_floor")  # the floor is no longer 2000
     for table, column, kind in MIGRATIONS:
         if column not in {r["name"] for r in con.execute(f"pragma table_info({table})")}:
             con.execute(f"alter table {table} add column {column} {kind}")
@@ -236,6 +248,17 @@ GAME_SPLIT = re.compile(rb'(?m)^\[Event "')
 TAG_RE = re.compile(rb'^\[(\w+)\s+"(.*)"\]\s*$', re.M)
 CLK_RE = re.compile(rb"\[%clk (\d+):(\d\d):(\d\d)")
 SITE_SLUG_RE = re.compile(r"chess\.com/events/([^/\"]+)")
+SITE_TAG_RE = re.compile(rb'^\[Site "(.*)"\]\s*$', re.M)
+
+
+def site_place(sites: Counter) -> str:
+    """The place a file's Site tags name; '' when they hold only Chess.com URLs
+    or nothing. Files from 2024 on state the venue there ("Napoli, IT")."""
+    for value, _ in sites.most_common():
+        value = value.strip()
+        if value and value != "?" and "://" not in value and "chess.com" not in value.lower():
+            return value
+    return ""
 
 
 def split_games(raw: bytes) -> list[bytes]:
@@ -306,8 +329,8 @@ def scan_file(path: Path) -> dict | None:
         return None
     players: dict[str, _Player] = {}
     name_to_fide: dict[str, set[str]] = defaultdict(set)
-    names, site_slugs, tcs = Counter(), Counter(), Counter()
-    game_dates, rounds = [], set()
+    names, site_slugs, tcs, sites = Counter(), Counter(), Counter(), Counter()
+    game_dates, rounds, url_rounds = [], set(), set()
     pairs: Counter = Counter()
     unfinished = fen_games = team_games = board_games = clock_games = byes = 0
     clk_max, all_elos, game_rows = [], [], []
@@ -316,9 +339,15 @@ def scan_file(path: Path) -> dict | None:
         header, moves = split_header(chunk)
         t = parse_tags(header)
         names[t.get("Event", "")] += 1
+        sites[t.get("Site", "")] += 1
         m = SITE_SLUG_RE.search(t.get("Site", ""))
         if m:
             site_slugs[m.group(1)] += 1
+            # .../events/2010-amber/01a-blind/...: the round, for files whose Round tags are "?"
+            # ("Basque01" in a match played in several formats is its own round).
+            m = re.search(r"/events/[^/]+/(?:0*(\d+)[^/]*|([^/]+))/", t.get("Site", ""))
+            if m:
+                url_rounds.add(m.group(1) or m.group(2))
         d = valid_date(t.get("Date", ""))
         if d:
             # EndDate counts only when it is the same game finishing: a stray
@@ -435,7 +464,8 @@ def scan_file(path: Path) -> dict | None:
         "event": {
             "slug": stem, "file": path.name, "name": names.most_common(1)[0][0],
             "site_slug": site_slugs.most_common(1)[0][0] if site_slugs else None,
-            "games": len(chunks) - byes, "byes": byes, "players": n, "rounds": len(rounds) or None,
+            "site_tag": site_place(sites),
+            "games": len(chunks) - byes, "byes": byes, "players": n, "rounds": len(rounds) or len(url_rounds) or None,
             "tag_start": tag_start, "tag_end": tag_end, "date_strays": strays,
             "slug_years": ",".join(slug_years) or None,
             "unfinished": unfinished, "fen_games": fen_games, "team_games": team_games,
@@ -532,6 +562,13 @@ def stage_scan(con: sqlite3.Connection, inboxes: list[Path], limit: int | None =
             con.commit()
         if limit and new >= limit:
             break
+    # Events scanned before site_tag was recorded: read just that tag.
+    for r in con.execute("select e.slug, e.file, f.dir from event e join file f on f.name = e.file "
+                         "where e.site_tag is null").fetchall():
+        path = source_path(r["dir"], r["file"])
+        if path:
+            found_sites = Counter(decode(v) for v in SITE_TAG_RE.findall(path.read_bytes()))
+            con.execute("update event set site_tag = ? where slug = ?", (site_place(found_sites), r["slug"]))
     con.commit()
     log(f"scan: {new} events read, {empty} empty files, {failed} failed, {moved} found in a new folder, "
         f"{skipped_fresh} too fresh to touch, {partial} still downloading")
@@ -874,6 +911,23 @@ def stage_match(con: sqlite3.Connection, limit: int | None = None) -> None:
                 names.append(raw_name)
             if rating:
                 ratings.append(rating)
+        if not names:
+            # No participant list: the roster is whoever plays the event's
+            # games, by the names as printed. Elysium has not resolved every
+            # side to a player (half the field of a 2023 round robin can be
+            # unresolved), so a roster of resolved players alone is too thin
+            # to match. game_observation has no index on game_id, but its ids
+            # are the games' ids; game_id is checked all the same.
+            game_ids = [r[0] for r in cur.execute("select id from game where event_id = ?", (event_id,))]
+            wanted, raw_names = set(game_ids), set()
+            for j in range(0, len(game_ids), 500):
+                part = game_ids[j:j + 500]
+                for game_id, white, black in cur.execute(
+                        "select game_id, raw_white, raw_black from game_observation "
+                        f"where id in ({','.join('?' * len(part))})", part):
+                    if game_id in wanted:
+                        raw_names.update(x for x in (white, black) if x)
+            names = sorted(raw_names)
         if not names:
             ids = set()
             for w, b in cur.execute("select white_player_id, black_player_id from game where event_id = ?",
@@ -1500,6 +1554,8 @@ def stage_classify(con: sqlite3.Connection) -> None:
             decision, reason = "series", f"{series} has its own archive"
         elif ENGINE_PATTERN.search(hay):
             decision, reason = "engine", "engine event"
+        elif TEST_PATTERN.search(hay):
+            decision, reason = "test", "a broadcast test, not an event"
         elif ratings and max(ratings) > 2900:
             decision, reason = "engine", f"a participant is rated {max(ratings)}: an engine"
         elif avg is None:
@@ -1517,7 +1573,7 @@ def stage_classify(con: sqlite3.Connection) -> None:
             reason = f"average {avg} over {len(ratings)} of {ev['players']} players"
         if doubts and decision in ("keep", "cull"):
             reason += f", leaving out {len(doubts)} doubted identit{'y' if len(doubts) == 1 else 'ies'}"
-        if decision == "keep" and below:
+        if decision == "keep" and below and ev["players"] <= FLOOR_EXEMPT_PLAYERS:
             decision = "cull"
             reason = (f"{len(below)} player{'s' if len(below) != 1 else ''} under {RATING_FLOOR} "
                       f"(lowest {below[0]}); average {avg}")
@@ -1526,10 +1582,15 @@ def stage_classify(con: sqlite3.Connection) -> None:
             # Two independent event-time figures on opposite sides of the line.
             decision = "review"
             reason = f"average {avg} here but {ev['ely_avg']} in the matched {ev['ely_source']} crosstable"
+        if (decision == "cull" and ev["players"] > FLOOR_EXEMPT_PLAYERS and OLYMPIAD_PATTERN.search(hay)
+                and not OLYMPIAD_EXCLUDED.search(hay)):
+            decision, reason = "keep", f"an Olympiad, kept by name ({reason})"
         display = ev["xt_name"] if table_ok and ev["xt_name"] else ev["name"]
+        # "... Live", "... Secret": Chess.com's label for the copy, not part of the event's name.
+        display = re.sub(r"(\s+(Live|Secret|Broadcast))+$", "", display, flags=re.I) or display
         con.execute(
             "update event set rated_players = ?, backfilled_players = ?, avg_rating = ?, avg_basis = ?, "
-            "avg_computed = ?, min_rating = ?, max_rating = ?, below_2000 = ?, category = ?, decision = ?, "
+            "avg_computed = ?, min_rating = ?, max_rating = ?, below_floor = ?, category = ?, decision = ?, "
             "reason = ?, start = ?, end = ?, date_basis = ?, identity_doubt = ?, display_name = ?, "
             "tags_standard = ?, unrated_then = ?, unknown_rating = ? where slug = ?",
             (len(ratings), backfilled, avg, basis, computed, min(ratings) if ratings else None,
@@ -1537,8 +1598,110 @@ def stage_classify(con: sqlite3.Connection) -> None:
              category, decision, reason, start, end, date_basis, identity_doubt, display,
              tags_standard, unrated_then, unknown, ev["slug"]))
     con.commit()
+    drop_twins(con)
+    assign_publish_names(con)
     counts = Counter(r["decision"] for r in con.execute("select decision from event"))
     log("classify: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
+
+
+# --------------------------------------------------------------------------
+# published file names: YYYY-MM-DD-site-event
+# --------------------------------------------------------------------------
+
+ONLINE_HOSTS = (("chess.com", "chess-com"), ("chess24", "chess24-com"), ("lichess", "lichess-org"),
+                ("chessbase", "chessbase"), ("playchess", "playchess"), ("tornelo", "tornelo"),
+                ("internet", "online"), ("online", "online"))
+VENUE_WORDS = re.compile(r"\d|\b(hotel|club|cent(er|re|ro)|resort|school|hall|universit|academy|museum|palace|casino|"
+                         r"library|arena|stadium|complex|campus|college|institute|room|floor|street|avenue|house|"
+                         r"mercado|sala)\b", re.I)
+COUNTRY_NAMES = {"china", "sweden", "poland", "norway", "slovakia", "czech republic", "iceland", "india", "germany",
+                 "france", "spain", "italy", "hungary", "russia", "usa", "england", "netherlands", "denmark",
+                 "serbia", "croatia", "romania", "ukraine", "turkey", "greece", "austria", "switzerland"}
+
+
+def file_slug(text: str) -> str:
+    text = unicodedata.normalize("NFKD", text or "")
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
+def place_slug(place: str | None) -> str:
+    """The town in a place string, as a filename part: 'Saint Louis USA' and
+    'Saint Louis, US' -> 'saint-louis'; 'Hotel Habana Libre, La Habana, CU' ->
+    'la-habana'. An online host -> 'chess-com' and the like; and with no place
+    on record the site is Chess.com, which carried the event."""
+    text = re.sub(r"\([^)]*\)", " ", place or "").strip()
+    low = text.lower()
+    for needle, slug in ONLINE_HOSTS:
+        if needle in low:
+            return slug
+    parts = [part.strip() for part in re.split(r",|\s-\s|/", text) if part.strip()]
+    if len(parts) > 1 and (re.fullmatch(r"[A-Za-z]{2,3}", parts[-1]) or parts[-1].lower() in COUNTRY_NAMES):
+        parts.pop()                                              # 'Napoli, IT', 'xinghua, China'
+    parts = [re.sub(r"\s+[A-Z]{3}$", "", part) for part in parts]  # 'Warsaw POL', 'Van Nuys, CA USA'
+    towns = [part for part in parts if not VENUE_WORDS.search(part) and file_slug(part)]
+    return file_slug(towns[0] if towns else (parts[0] if parts else "")) or "chess-com"
+
+
+def publish_name(start: str, place: str | None, name: str, slug: str) -> str:
+    """YYYY-MM-DD-site-event. An unknown month or day is 00. The event part is
+    the name without the year the date already gives."""
+    words = [w for w in file_slug(name).split("-") if w != start[:4]]
+    while len(words) > 1 and words[-1] in ("live", "secret", "broadcast"):
+        words.pop()   # Chess.com's label for a copy of the event, not part of its name
+    event = "-".join(words) or "-".join(w for w in file_slug(slug).split("-") if w != start[:4]) or "event"
+    return f"{(start + '-00-00')[:10]}-{place_slug(place)}-{event}"
+
+
+def twin_base(slug: str) -> str:
+    while TWIN_SUFFIX.search(slug):
+        slug = TWIN_SUFFIX.sub("", slug)
+    return slug
+
+
+def drop_twins(con: sqlite3.Connection) -> None:
+    """Of the kept copies of one event (the event and its "-live", "-secret"
+    or "-broadcast" ids) keep the one with the most games; the plain id wins a
+    tie. A "-live" copy is often the fuller one."""
+    groups: dict[str, list] = defaultdict(list)
+    for ev in con.execute("select slug, games from event where decision = 'keep'"):
+        groups[twin_base(ev["slug"]).lower()].append(ev)
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        best = max(members, key=lambda ev: (ev["games"], not TWIN_SUFFIX.search(ev["slug"]), ev["slug"]))
+        for ev in members:
+            if ev["slug"] != best["slug"]:
+                con.execute("update event set decision = 'twin', reason = ? where slug = ?",
+                            (f"another copy of {best['slug']} ({best['games']} games against {ev['games']})", ev["slug"]))
+    con.commit()
+
+
+def assign_publish_names(con: sqlite3.Connection) -> None:
+    """Give every kept event its published file name. Two events that would
+    share one (a festival's classical and blitz under one crosstable name, a
+    broadcast and its "-live" twin) fall back to Chess.com's own names for
+    them, and after that to a number."""
+    events = con.execute("select * from event where decision = 'keep' and start is not null order by slug").fetchall()
+
+    def place(ev):
+        return (ev["xt_place"] if ev["xt_id"] and ev["xt_name_ok"] else None) or ev["ely_place"] or ev["site_tag"]
+
+    names = {ev["slug"]: publish_name(ev["start"], place(ev), ev["display_name"] or ev["name"], ev["slug"])
+             for ev in events}
+    shared = {name for name, n in Counter(names.values()).items() if n > 1}
+    for ev in events:
+        if names[ev["slug"]] in shared:
+            names[ev["slug"]] = publish_name(ev["start"], place(ev), ev["name"], ev["slug"])
+    taken: Counter = Counter()
+    con.execute("update event set pub_name = null")
+    for ev in events:
+        name = names[ev["slug"]]
+        taken[name] += 1
+        if taken[name] > 1:
+            name = f"{name}-{taken[name]}"
+        con.execute("update event set pub_name = ? where slug = ?", (name, ev["slug"]))
+    con.commit()
 
 
 # --------------------------------------------------------------------------
@@ -1590,7 +1753,7 @@ def event_signature(ev: sqlite3.Row, file_sig: tuple) -> str:
     keys = ("name", "start", "end", "date_basis", "avg_rating", "avg_basis", "category", "format",
             "ely_event_id", "ely_place", "ely_name", "elo_suspect", "date_suspect", "rating_month",
             "identity_doubt", "display_name", "xt_id", "xt_name_ok", "xt_rows", "xt_final", "avg_computed",
-            "tags_standard", "xt_fit", "xt_pool", "xt_place", "xt_country", "xt_rounds")
+            "tags_standard", "xt_fit", "xt_pool", "xt_place", "xt_country", "xt_rounds", "site_tag")
     blob = json.dumps([VERSION, file_sig, [ev[k] for k in keys]], default=str)
     return hashlib.sha1(blob.encode()).hexdigest()
 
@@ -1675,7 +1838,7 @@ def build_ctml(ev: dict, players: list[dict], source: Path, fp_scheme, fp_cls) -
         date_raw = f"as stated by the {table_label}"
 
     # What the matched crosstable states is used only when the match is firm.
-    place = (ev["xt_place"] if table_ok else None) or ev["ely_place"]
+    place = (ev["xt_place"] if table_ok else None) or ev["ely_place"] or ev["site_tag"]
     country = ev["xt_country"] if table_ok and re.fullmatch(r"[A-Z]{3}", ev["xt_country"] or "") else None
     if country == "INT":  # TWIC's code for an online event, not a federation
         country = None
@@ -2366,9 +2529,10 @@ def stage_publish(con: sqlite3.Connection, workers: int = WORKERS) -> None:
     for ev in events:
         first, last, precision = iso_bounds(ev["start"], ev["end"])
         year = int(first[:4])
-        jobs.append((ev["slug"], str(HOME / ev["pgn_path"]), str(HOME / ev["ctml_path"]),
-                     str(REPO / str(year) / f"{ev['slug']}.zip")))
-        rows[ev["slug"]] = (ev, first, last, precision, year)
+        published = ev["pub_name"] or ev["slug"]
+        jobs.append((published, str(HOME / ev["pgn_path"]), str(HOME / ev["ctml_path"]),
+                     str(REPO / str(year) / f"{published}.zip")))
+        rows[published] = (ev, first, last, precision, year)
 
     entries, rewritten, pgn_bytes, ctml_bytes = [], 0, 0, 0
     for slug, size, sha, changed, packed_pgn, packed_ctml in run_jobs(_zip_job, jobs, workers):
@@ -2382,11 +2546,12 @@ def stage_publish(con: sqlite3.Connection, workers: int = WORKERS) -> None:
             country = None
         entry = {
             "slug": slug, "zip": f"{slug}.zip", "pgn": f"{slug}.pgn", "ctml": f"{slug}.ctml",
+            "sourceSlug": ev["slug"],
             "year": year, "start": first, "end": last,
             "name": ev["display_name"] or ev["name"], "sourceName": ev["name"],
-            "place": (ev["xt_place"] if firm else None) or ev["ely_place"] or "",
+            "place": (ev["xt_place"] if firm else None) or ev["ely_place"] or ev["site_tag"] or "",
             "country": country, "games": ev["ctml_games"], "players": ev["players"],
-            "ratedPlayers": ev["rated_players"], "rounds": ev["xt_rounds"] if firm else None,
+            "ratedPlayers": ev["rated_players"], "rounds": (ev["xt_rounds"] if firm else None) or ev["rounds"],
             "format": ev["format"], "avgRating": ev["avg_rating"], "category": ev["category"],
             "avgStated": (ev["avg_basis"] or "").startswith("stated:"),
             "url": f"https://github.com/{GITHUB_REPO}/raw/main/{year}/{slug}.zip",
@@ -2398,11 +2563,11 @@ def stage_publish(con: sqlite3.Connection, workers: int = WORKERS) -> None:
 
     # Events published before this pipeline existed stay listed, unchanged,
     # until their PGN has been downloaded again and judged here.
-    scanned = {r[0] for r in con.execute("select slug from event")}
+    scanned = {r[0] for r in con.execute("select slug from event")} | set(rows)
     legacy = []
     if MANIFEST.exists():
         for old in json.loads(MANIFEST.read_text(encoding="utf-8")):
-            if (old.get("legacy") or "ctml" not in old) and old["slug"] not in scanned:
+            if (old.get("legacy") or "ctml" not in old) and old.get("sourceSlug", old["slug"]) not in scanned:
                 legacy.append({**old, "legacy": True})
     entries += legacy
     entries.sort(key=lambda e: (e["start"], e["end"], e["slug"]), reverse=True)
@@ -2432,11 +2597,11 @@ def stage_publish(con: sqlite3.Connection, workers: int = WORKERS) -> None:
 # --------------------------------------------------------------------------
 
 EXPORT_COLUMNS = (
-    "slug", "display_name", "name", "decision", "reason", "start", "end", "date_basis",
+    "slug", "pub_name", "display_name", "name", "decision", "reason", "start", "end", "date_basis",
     "avg_rating", "category", "avg_basis", "avg_computed",
-    "xt_place", "xt_country", "xt_rounds", "xt_kind", "xt_score", "xt_name_ok", "xt_source", "xt_ref",
+    "xt_place", "site_tag", "xt_country", "xt_rounds", "xt_kind", "xt_score", "xt_name_ok", "xt_source", "xt_ref",
     "xt_title", "xt_start", "xt_end", "xt_category", "xt_avg", "xt_final", "xt_fit", "xt_rows",
-    "players", "rated_players", "backfilled_players", "min_rating", "max_rating", "below_2000",
+    "players", "rated_players", "backfilled_players", "min_rating", "max_rating", "below_floor",
     "games", "byes", "rounds", "format", "format_note", "cadence_guess", "time_control",
     "unrated_then", "unknown_rating", "tags_standard", "identity_doubt", "ely_name", "ely_place", "ely_source", "ely_kind", "ely_start", "ely_end", "ely_score",
     "ely_avg", "ely_avg_n", "elo_suspect", "elo_reason", "rating_month",
