@@ -10,6 +10,15 @@ players (an Olympiad, a World Cup, a big open) only has to meet the average.
 The Olympiads themselves (open and women's, not the youth, disabled or online
 ones) are kept by name whatever their average.
 
+**Historical tournaments.** PGNs in `D:\pgn\historical-tours` (one event per
+file, cut with PgnTools' Tour Breaker from a collection that keeps only games
+where both players are rated 2400+) go through the same stages with
+`origin = 'historical'`: nothing is looked up in Elysium or the crosstables,
+the Elo tags (Edo or Chessmetrics) are the ratings, a file with no full dates
+is dated to its month or year, format and rounds come from the `EventType` and
+`EventRounds` tags, and a name that belongs to another year's event at the same
+place is replaced by town and year. Only the main line of each game is kept.
+
 ## Run it
 
 Use the CTML project's interpreter (it has python-chess and lxml), from the

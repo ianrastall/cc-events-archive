@@ -4,7 +4,14 @@ Past Chess.com events with a tournament average of 2300 or more and no player
 rated below 2200, one ZIP per event. Fields of more than 200 players only need
 the average, and the Olympiads (open and women's) are included whatever theirs.
 
-- **Average and floor** use each player's FIDE standard rating at the time of
+- **Historical tournaments** (1834-1990, `"historical": true` in the
+  manifest) come from a historical game collection, not from Chess.com. Their
+  ratings are Edo or Chessmetrics, and each file holds only the games between
+  players rated 2400 or more, so most are not complete crosstables. The
+  source's annotations are not included.
+- **Prepared databases** of everything, of the 2600+ events and of the 2700+
+  events are listed in `cc_events_bundles.json`.
+- **Average and floor** for Chess.com events use each player's FIDE standard rating at the time of
   the event. The ratings in Chess.com's own files are not used for this: for
   events before October 2020 they are the ratings of early 2021, and for later
   online, rapid and blitz events they are often not standard ratings.
