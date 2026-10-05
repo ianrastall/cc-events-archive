@@ -187,6 +187,15 @@ Entries already in the manifest from the earlier collection are carried over as
 `"legacy": true` until their slug has been scanned here; ZIPs the manifest no
 longer lists are deleted.
 
+**bundles** (also run at the end of `publish`) — the three prepared databases
+in `bundles/`: `cc-events-all` (every kept event), `cc-events-2600` and
+`cc-events-2700` (tournament average at or above that), each one PGN with the
+events oldest first, zipped. GitHub refuses files over 100 MB, so a database
+that would exceed 95 MB is written as consecutive parts split at year
+boundaries (`cc-events-all-1972-2021.zip`, ...). `cc_events_bundles.json` lists
+them; the site's PGN Downloads page and Events tab are built from it. Commit
+`bundles/` and that file with every publish.
+
 ## Known gaps
 
 - World Championship matches have only a schedule table in TWIC, so they get no

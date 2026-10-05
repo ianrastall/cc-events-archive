@@ -20,6 +20,7 @@ cc_events_manifest.json. Nothing here commits or pushes.
     run        all of the above, in order
 
     verify     replay source and regenerated PGN side by side
+    bundles    write the three prepared databases (all, 2600+, 2700+); publish does this too
     publish    write <year>/<slug>.zip and the manifest into the working tree
 
 Run with the CTML project's interpreter, which has python-chess and lxml:
@@ -2589,7 +2590,101 @@ def stage_publish(con: sqlite3.Connection, workers: int = WORKERS) -> None:
         f"{total / 1e6:.0f} MB in all ({pgn_bytes / 1e6:.0f} MB PGN + {ctml_bytes / 1e6:.0f} MB CTML packed) "
         f"({time.time() - started:.0f}s)")
     log(f"manifest: {MANIFEST}")
+    stage_bundles(con)
     log("Nothing has been committed or pushed.")
+
+
+# The three prepared databases: every kept event, the events averaging 2600 or
+# more, and those averaging 2700 or more. Each is one PGN, oldest event first.
+BUNDLE_DIR = REPO / "bundles"
+BUNDLES_MANIFEST = REPO / "cc_events_bundles.json"
+BUNDLES = (("cc-events-all", 0, "Every event in the archive"),
+           ("cc-events-2600", 2600, "Events with a tournament average of 2600 or more"),
+           ("cc-events-2700", 2700, "Events with a tournament average of 2700 or more"))
+BUNDLE_PART_BYTES = 95_000_000   # GitHub refuses files over 100 MB; a bigger database is split by year
+
+
+def _bundle_zip(name: str, members: list[tuple[str, list]]) -> tuple[bytes, int]:
+    import zipfile
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for member, events in members:
+            info = zipfile.ZipInfo(member, ZIP_TIME)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o644 << 16
+            with archive.open(info, "w", force_zip64=True) as out:
+                for ev in events:
+                    text = (HOME / ev["pgn_path"]).read_bytes()
+                    out.write(text if text.endswith(b"\n\n") else text.rstrip(b"\r\n") + b"\n\n")
+    return buffer.getvalue(), sum(len(events) for _, events in members)
+
+
+def stage_bundles(con: sqlite3.Connection) -> None:
+    """Write bundles/<name>.zip for each prepared database, and
+    cc_events_bundles.json describing them. A database too large for one
+    GitHub file is written as consecutive parts, each a run of whole years."""
+    started = time.time()
+    kept = con.execute(
+        "select * from event where decision = 'keep' and ctml_valid = 1 and pgn_path is not null "
+        "and pgn_sig is not null order by start, slug").fetchall()
+    BUNDLE_DIR.mkdir(exist_ok=True)
+    described, written = [], set()
+    # "updated" is the day a database last changed, not the day this ran.
+    before = {}
+    if BUNDLES_MANIFEST.exists():
+        before = {b["id"]: b for b in json.loads(BUNDLES_MANIFEST.read_text(encoding="utf-8"))}
+    for name, floor, title in BUNDLES:
+        events = [ev for ev in kept if ev["avg_rating"] >= floor]
+        data, _ = _bundle_zip(name, [(f"{name}.pgn", events)])
+        parts = [(f"{name}.zip", data, events)]
+        if len(data) > BUNDLE_PART_BYTES:
+            # Split at year boundaries into as few parts as fit under the limit.
+            by_year: dict[str, list] = defaultdict(list)
+            for ev in events:
+                by_year[ev["start"][:4]].append(ev)
+            years, parts, run = sorted(by_year), [], []
+
+            def close(run_years):
+                label = run_years[0] if len(run_years) == 1 else f"{run_years[0]}-{run_years[-1]}"
+                run_events = [ev for y in run_years for ev in by_year[y]]
+                blob, _ = _bundle_zip(name, [(f"{name}-{label}.pgn", run_events)])
+                return (f"{name}-{label}.zip", blob, run_events)
+
+            for year in years:
+                if run and len(close(run + [year])[1]) > BUNDLE_PART_BYTES:
+                    parts.append(close(run))
+                    run = []
+                run.append(year)
+            parts.append(close(run))
+        files = []
+        for filename, blob, part_events in parts:
+            target = BUNDLE_DIR / filename
+            if not target.exists() or target.read_bytes() != blob:
+                target.write_bytes(blob)
+            written.add(filename)
+            files.append({
+                "file": filename, "bytes": len(blob), "sha256": hashlib.sha256(blob).hexdigest(),
+                "events": len(part_events), "games": sum(ev["ctml_games"] for ev in part_events),
+                "from": part_events[0]["start"][:4], "to": part_events[-1]["start"][:4],
+                "url": f"https://github.com/{GITHUB_REPO}/raw/main/bundles/{filename}",
+            })
+        old = before.get(name, {})
+        unchanged = [f["sha256"] for f in old.get("files", [])] == [f["sha256"] for f in files]
+        described.append({
+            "id": name, "title": title, "minAverage": floor, "events": len(events),
+            "updated": old["updated"] if unchanged and old.get("updated") else dt.date.today().isoformat(),
+            "games": sum(ev["ctml_games"] for ev in events), "bytes": sum(f["bytes"] for f in files),
+            "newest": max(ev["start"] for ev in events), "files": files,
+        })
+        log(f"bundles: {name}: {len(events)} events, {described[-1]['games']} games, "
+            f"{described[-1]['bytes'] / 1e6:.0f} MB in {len(files)} file{'s' if len(files) != 1 else ''}")
+    for stale in BUNDLE_DIR.glob("*.zip"):
+        if stale.name not in written:
+            stale.unlink()
+    BUNDLES_MANIFEST.write_text(json.dumps(described, ensure_ascii=False, indent=2) + "\n",
+                                encoding="utf-8", newline="\n")
+    log(f"bundles: {BUNDLES_MANIFEST} ({time.time() - started:.0f}s)")
 
 
 # --------------------------------------------------------------------------
@@ -2642,7 +2737,7 @@ def main() -> int:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("stage", choices=("scan", "enrich", "match", "tables", "classify", "ctml", "pgn", "verify",
-                                      "publish", "export", "status", "run"))
+                                      "publish", "bundles", "export", "status", "run"))
     ap.add_argument("--inbox", type=Path, action="append",
                     help="folder of downloaded PGNs (repeatable); default: the folders in INBOXES")
     ap.add_argument("--limit", type=int, help="process at most N events in this stage")
@@ -2679,6 +2774,8 @@ def main() -> int:
             stage_verify(con, args.limit, args.only, args.workers)
         elif stage == "publish":
             stage_publish(con, args.workers)
+        elif stage == "bundles":
+            stage_bundles(con)
         elif stage == "export":
             stage_export(con)
         elif stage == "status":
